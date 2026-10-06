@@ -27,18 +27,21 @@ type Result struct {
 
 // Stats are service-wide diagnostics. The three step paths are counted
 // separately: speculative success, non-speculative fallback and failure.
+// EmittedTokens counts exactly the tokens delivered to callers, so the
+// aggregate always equals the sum of delivered tokens across requests.
 type Stats struct {
-	InFlight         int64
-	RequestsOK       int64
-	RequestsFailed   int64
-	SuccessSteps     int64
-	FallbackSteps    int64
-	FailedSteps      int64
-	ProposedTokens   int64
-	AcceptedTokens   int64
-	EmittedTokens    int64
-	Rollbacks        int64
-	TimeoutFallbacks int64
+	InFlight             int64
+	RequestsOK           int64
+	RequestsFailed       int64
+	SuccessSteps         int64
+	FallbackSteps        int64
+	FailedSteps          int64
+	ProposedTokens       int64
+	AcceptedTokens       int64
+	EmittedTokens        int64
+	Rollbacks            int64
+	TimeoutFallbacks     int64
+	VerifyErrorFallbacks int64
 }
 
 // AcceptRate is AcceptedTokens / ProposedTokens across all requests.
@@ -81,17 +84,18 @@ type Service struct {
 	closeOnce sync.Once
 	routeSeq  atomic.Uint64
 
-	inFlight         atomic.Int64
-	requestsOK       atomic.Int64
-	requestsFailed   atomic.Int64
-	successSteps     atomic.Int64
-	fallbackSteps    atomic.Int64
-	failedSteps      atomic.Int64
-	proposedTokens   atomic.Int64
-	acceptedTokens   atomic.Int64
-	emittedTokens    atomic.Int64
-	rollbacks        atomic.Int64
-	timeoutFallbacks atomic.Int64
+	inFlight             atomic.Int64
+	requestsOK           atomic.Int64
+	requestsFailed       atomic.Int64
+	successSteps         atomic.Int64
+	fallbackSteps        atomic.Int64
+	failedSteps          atomic.Int64
+	proposedTokens       atomic.Int64
+	acceptedTokens       atomic.Int64
+	emittedTokens        atomic.Int64
+	rollbacks            atomic.Int64
+	timeoutFallbacks     atomic.Int64
+	verifyErrorFallbacks atomic.Int64
 }
 
 // New creates a service and starts its worker/batcher goroutines.
@@ -170,6 +174,7 @@ func (s *Service) runOne(parent context.Context, req Request, b *batcher) (res *
 	s.emittedTokens.Add(st.EmittedTokens)
 	s.rollbacks.Add(st.Rollbacks)
 	s.timeoutFallbacks.Add(st.TimeoutFallbacks)
+	s.verifyErrorFallbacks.Add(st.VerifyErrorFallbacks)
 
 	if err != nil {
 		s.requestsFailed.Add(1)
@@ -183,17 +188,18 @@ func (s *Service) runOne(parent context.Context, req Request, b *batcher) (res *
 // Stats returns an aggregate snapshot.
 func (s *Service) Stats() Stats {
 	return Stats{
-		InFlight:         s.inFlight.Load(),
-		RequestsOK:       s.requestsOK.Load(),
-		RequestsFailed:   s.requestsFailed.Load(),
-		SuccessSteps:     s.successSteps.Load(),
-		FallbackSteps:    s.fallbackSteps.Load(),
-		FailedSteps:      s.failedSteps.Load(),
-		ProposedTokens:   s.proposedTokens.Load(),
-		AcceptedTokens:   s.acceptedTokens.Load(),
-		EmittedTokens:    s.emittedTokens.Load(),
-		Rollbacks:        s.rollbacks.Load(),
-		TimeoutFallbacks: s.timeoutFallbacks.Load(),
+		InFlight:             s.inFlight.Load(),
+		RequestsOK:           s.requestsOK.Load(),
+		RequestsFailed:       s.requestsFailed.Load(),
+		SuccessSteps:         s.successSteps.Load(),
+		FallbackSteps:        s.fallbackSteps.Load(),
+		FailedSteps:          s.failedSteps.Load(),
+		ProposedTokens:       s.proposedTokens.Load(),
+		AcceptedTokens:       s.acceptedTokens.Load(),
+		EmittedTokens:        s.emittedTokens.Load(),
+		Rollbacks:            s.rollbacks.Load(),
+		TimeoutFallbacks:     s.timeoutFallbacks.Load(),
+		VerifyErrorFallbacks: s.verifyErrorFallbacks.Load(),
 	}
 }
 

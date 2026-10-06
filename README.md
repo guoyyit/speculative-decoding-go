@@ -61,16 +61,21 @@ Pearson 卡方检验（df=V-1，阈值 χ²≈40）验证两种生成方式同�
 - 每次拒绝计入 `Rollbacks`。
 - 缓存按容量淘汰最旧 token，配合模型的有限上下文窗口保证内存长期有界。
 
-## 超时与取消
+## 超时、验证失败与取消
 
 - `spec.Config.VerifyTimeoutMS > 0` 时，单次并行验证有独立截止时间。
   超时则**丢弃全部候选、缓存回滚到步前快照、退回不投机的逐 token 生成一次**，
   该步记为 `fallback / verify_timeout`，`TimeoutFallbacks` 与 `Rollbacks` 各 +1，
   不产出部分候选，序列不留在中间位置。
+- 验证也可能因超时之外的原因失败（如批处理通道关闭、验证器内部错误）。
+  只要请求自身 ctx 仍然存活，处理与超时完全一致：丢弃全部候选、回滚、
+  退回逐 token 生成一次，该步记为 `fallback / verify_error`，
+  `VerifyErrorFallbacks` 与 `Rollbacks` 各 +1。**两种原因分别计数、互不影响**，
+  且单次失败不影响该请求继续完成生成，也不影响其他并发请求。
 - 请求自身 ctx 取消：当前提议/验证立即返回错误，已暂存候选被回滚，
   该请求不产出 token，计为 `failure`，不影响任何其他请求。
-- 三类路径分别统计：`success`（投机成功步）、`fallback`（超时退回步）、
-  `failure`（取消/错误步）。
+- 三类路径分别统计：`success`（投机成功步）、`fallback`（验证失败退回步，
+  按 `verify_timeout` / `verify_error` 细分）、`failure`（取消/错误步）。
 
 ## 并发与批处理
 
@@ -90,12 +95,20 @@ Pearson 卡方检验（df=V-1，阈值 χ²≈40）验证两种生成方式同�
 
 | 指标 | 含义 |
 | --- | --- |
-| `AcceptRate` | `AcceptedTokens / ProposedTokens` |
-| `TokensPerStep` | `EmittedTokens / (success+fallback+failed steps)` |
+| `EmittedTokens` | **实际交付给调用方的 token 总数**；任何请求、任何长度下都等于 `Generate` 返回的 token 数 |
+| `AcceptRate` | `AcceptedTokens / ProposedTokens`，恒在 `[0,1]` |
+| `TokensPerStep` | `EmittedTokens / (success+fallback+failed steps)`，由实际交付数量计算 |
 | `SuccessSteps / FallbackSteps / FailedSteps` | 三类路径计数 |
-| `Rollbacks` | 拒绝回滚次数（含超时退回的回滚） |
-| `TimeoutFallbacks` | 验证超时退回次数 |
+| `Rollbacks` | 拒绝回滚次数（含验证失败退回的回滚） |
+| `TimeoutFallbacks` | 验证超时（`verify_timeout`）退回次数 |
+| `VerifyErrorFallbacks` | 非超时验证失败（`verify_error`）退回次数 |
 | `RequestsOK / RequestsFailed / InFlight` | 请求级状态 |
+
+**产出 token 口径**：一步最多可提交 `DraftK+1` 个 token；当请求的剩余生成长度
+小于该值时，只有实际交付的那部分 token 被计入 `EmittedTokens`（缓存中也只保留
+已交付前缀）。该口径覆盖全部接受、候选拒绝、EOS 提前结束、验证失败退回所有
+路径，不漏记也不重复记。服务端聚合值精确等于各请求统计值之和，
+与批次大小、等待窗口、工作协程数量无关（有专门测试固定这三种配置断言逐字段相等）。
 
 草稿与目标越接近接受率越高；`DraftNoise=0` 时接受率为 1，
 每步稳定产出 `DraftK+1` 个 token（`TokensPerStep > 1`）。
@@ -139,8 +152,15 @@ Pearson 卡方检验（df=V-1，阈值 χ²≈40）验证两种生成方式同�
 
 - 分布等价性（卡方）、残差恒等式 `norm(max(p-q,0))+min(p,q)=p`、接受规则边界
 - 拒绝回滚（被拒候选不进输出、缓存只留接受前缀+修正 token）
+- 产出 token 口径：剩余长度小于/恰好等于单步产出上限、拒绝修正恰好用尽预算、
+  预算截断修正 token、EOS 提前结束——`EmittedTokens` 与每步 `Emitted` 之和
+  均精确等于实际交付 token 数（全部精确数值断言）
 - 验证超时退回（逐 token 产出、计数与原因正确、不等待完整验证）
+- 非超时验证失败与超时退回的区分：`verify_error` / `verify_timeout` 分别计数，
+  失败不影响请求继续生成，退回 token 与纯目标模型逐 token 生成逐条一致
 - 请求取消不产出 token、不留中间状态
 - 多请求并发隔离、单请求取消不影响他人、批处理不改变输出
+- 并发长短请求混合时服务聚合统计精确等于各请求（直接生成路径）统计之和，
+  且与 `BatchSize` / `BatchWindowMS` / `Workers` 无关
 - 固定种子逐条复现、不同种子不同
 - 有界缓存淘汰与淘汰后回滚

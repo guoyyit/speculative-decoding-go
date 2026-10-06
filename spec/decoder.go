@@ -2,6 +2,7 @@ package spec
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/guoyyit/speculative-decoding-go/kv"
@@ -31,7 +32,12 @@ func (o StepOutcome) String() string {
 
 // Fallback causes recorded in StepResult.
 const (
+	// CauseVerifyTimeout marks a fallback triggered by the per-verify
+	// deadline (VerifyTimeoutMS) expiring.
 	CauseVerifyTimeout = "verify_timeout"
+	// CauseVerifyError marks a fallback triggered by any other verification
+	// failure (e.g. the verifier returned a non-deadline error).
+	CauseVerifyError = "verify_error"
 )
 
 // StepResult is the diagnostic record of one generation step.
@@ -170,11 +176,22 @@ func (d *Decoder) step(ctx context.Context, budget int) ([]int, StepResult, erro
 			d.stats.FailedSteps++
 			return nil, StepResult{Outcome: OutcomeFailure, FallbackCause: "request_canceled"}, ctx.Err()
 		}
-		// Verification timeout (or other verify failure): discard every
-		// staged candidate and emit exactly one vanilla target token.
+		// Verification failed while the request itself is still alive.
+		// Classify the real cause: an expired per-verify deadline is a
+		// timeout; anything else is a generic verify error. Both discard
+		// every staged candidate and emit exactly one vanilla target token,
+		// so the request keeps making progress.
+		cause := CauseVerifyTimeout
+		if !errors.Is(verr, context.DeadlineExceeded) {
+			cause = CauseVerifyError
+		}
 		d.cache.Reset(history)
 		d.stats.Rollbacks++
-		d.stats.TimeoutFallbacks++
+		if cause == CauseVerifyTimeout {
+			d.stats.TimeoutFallbacks++
+		} else {
+			d.stats.VerifyErrorFallbacks++
+		}
 		d.stats.FallbackSteps++
 		tok := d.vanillaToken(history)
 		d.cache.Append(tok)
@@ -184,7 +201,7 @@ func (d *Decoder) step(ctx context.Context, budget int) ([]int, StepResult, erro
 			Emitted:       1,
 			Proposed:      len(proposal.Tokens),
 			RolledBack:    true,
-			FallbackCause: CauseVerifyTimeout,
+			FallbackCause: cause,
 		}, nil
 	}
 
@@ -193,6 +210,7 @@ func (d *Decoder) step(ctx context.Context, budget int) ([]int, StepResult, erro
 	// Accept the longest accepted prefix using target probabilities only.
 	rejected := false
 	accepted := 0
+	correction := 0
 	for accepted < len(proposal.Tokens) {
 		tok := proposal.Tokens[accepted]
 		p := pRows[accepted][tok]
@@ -202,39 +220,23 @@ func (d *Decoder) step(ctx context.Context, budget int) ([]int, StepResult, erro
 			// Reject at position accepted; resample from the normalized
 			// residual distribution norm(max(p - q, 0)).
 			adj := residualDistribution(pRows[accepted], proposal.Q[accepted])
-			fixed := d.sampler.Sample(adj)
-			// Rebuild from the pre-step history copy plus the accepted
-			// prefix and the correction token. Truncating the staged cache
-			// in place is unsafe when bounded eviction has shifted entries.
-			restored := make([]int, 0, len(history)+accepted+1)
-			restored = append(restored, history...)
-			restored = append(restored, proposal.Tokens[:accepted]...)
-			restored = append(restored, fixed)
-			d.cache.Reset(restored)
-			res.Accepted = accepted
-			res.Emitted = accepted + 1
-			res.RolledBack = true
-			d.stats.Rollbacks++
-			d.stats.AcceptedTokens += int64(accepted)
+			correction = d.sampler.Sample(adj)
 			rejected = true
 			break
 		}
 		accepted++
-		// Cache already holds this staged token. An accepted EOS ends the
-		// sequence immediately: discard anything beyond it, no bonus draw.
+		// An accepted EOS ends the sequence immediately: discard anything
+		// beyond it, no bonus draw.
 		if tok == 0 {
-			eosTokens := append([]int(nil), proposal.Tokens[:accepted]...)
-			restored := make([]int, 0, len(history)+accepted)
-			restored = append(restored, history...)
-			restored = append(restored, eosTokens...)
-			d.cache.Reset(restored)
+			committed := capToBudget(proposal.Tokens[:accepted], budget)
+			d.commitCache(history, committed)
 			res.Accepted = accepted
-			res.Emitted = accepted
+			res.Emitted = len(committed)
 			d.stats.AcceptedTokens += int64(accepted)
 			d.stats.ProposedTokens += int64(len(proposal.Tokens))
 			d.stats.SuccessSteps++
 			d.recordEmitted(res.Emitted)
-			return eosTokens, res, nil
+			return append([]int(nil), committed...), res, nil
 		}
 	}
 
@@ -244,29 +246,24 @@ func (d *Decoder) step(ctx context.Context, budget int) ([]int, StepResult, erro
 		// Sample one bonus token from the target distribution at the final
 		// position, giving up to k+1 new tokens in a single step.
 		bonus := d.sampler.Sample(pRows[accepted])
-		d.cache.Append(bonus)
 		committed = append(append([]int(nil), proposal.Tokens...), bonus)
 		res.Accepted = accepted
-		res.Emitted = accepted + 1
-		d.stats.AcceptedTokens += int64(accepted)
 	} else {
-		// Rejected at the last accepted boundary: committed prefix plus the
-		// resampled correction token. Nothing after the boundary survives.
-		fixedCount := accepted + 1
-		if fixedCount > budget {
-			fixedCount = budget
-		}
-		committed = make([]int, 0, fixedCount)
-		for i := 0; i < accepted && i < budget; i++ {
-			committed = append(committed, proposal.Tokens[i])
-		}
-		if len(committed) < budget {
-			// Append the correction token; it was stored as the last element.
-			all := d.cache.Tokens()
-			committed = append(committed, all[len(all)-1])
-		}
+		// Rejected at the first rejected position: the committed stream is
+		// the accepted prefix plus the resampled correction token. Nothing
+		// after the rejection boundary survives.
+		committed = append(append([]int(nil), proposal.Tokens[:accepted]...), correction)
+		res.Accepted = accepted
+		res.RolledBack = true
+		d.stats.Rollbacks++
 	}
-
+	// Honor the remaining generation budget: only tokens actually delivered
+	// to the caller are committed to the cache and counted as emitted, so
+	// EmittedTokens never exceeds what Generate returns.
+	committed = capToBudget(committed, budget)
+	d.commitCache(history, committed)
+	res.Emitted = len(committed)
+	d.stats.AcceptedTokens += int64(accepted)
 	d.stats.ProposedTokens += int64(len(proposal.Tokens))
 	d.stats.SuccessSteps++
 	d.recordEmitted(res.Emitted)
@@ -277,6 +274,28 @@ func (d *Decoder) step(ctx context.Context, budget int) ([]int, StepResult, erro
 // operation as non-speculative generation.
 func (d *Decoder) vanillaToken(history []int) int {
 	return d.sampler.Sample(d.target.Dist(history))
+}
+
+// capToBudget trims a step's committed token stream to the remaining
+// generation budget. Only delivered tokens may be counted as emitted.
+func capToBudget(tokens []int, budget int) []int {
+	if budget < 0 {
+		budget = 0
+	}
+	if len(tokens) > budget {
+		return tokens[:budget]
+	}
+	return tokens
+}
+
+// commitCache rebuilds the cache as the pre-step history plus exactly the
+// committed (delivered) tokens, discarding every staged candidate beyond
+// them. Bounded eviction applies as usual, so memory stays bounded.
+func (d *Decoder) commitCache(history, committed []int) {
+	restored := make([]int, 0, len(history)+len(committed))
+	restored = append(restored, history...)
+	restored = append(restored, committed...)
+	d.cache.Reset(restored)
 }
 
 func (d *Decoder) recordEmitted(n int) {
@@ -335,6 +354,9 @@ type Stats struct {
 	EmittedTokens    int64
 	Rollbacks        int64
 	TimeoutFallbacks int64
+	// VerifyErrorFallbacks counts fallbacks caused by non-timeout
+	// verification failures (distinct from TimeoutFallbacks).
+	VerifyErrorFallbacks int64
 }
 
 // AcceptRate is AcceptedTokens / ProposedTokens.

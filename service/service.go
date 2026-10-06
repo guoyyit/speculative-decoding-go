@@ -23,6 +23,10 @@ type Result struct {
 	ID     string
 	Tokens []int
 	Err    error
+	// Stats is this request's exact per-decoder diagnostic snapshot. The
+	// service-wide aggregate equals the sum of these over every completed
+	// request (plus InFlight).
+	Stats spec.Stats
 }
 
 // Stats are service-wide diagnostics. The three step paths are counted
@@ -39,6 +43,7 @@ type Stats struct {
 	EmittedTokens    int64
 	Rollbacks        int64
 	TimeoutFallbacks int64
+	ErrorFallbacks   int64
 }
 
 // AcceptRate is AcceptedTokens / ProposedTokens across all requests.
@@ -75,6 +80,7 @@ type Service struct {
 	cfg       Config
 	target    *model.Target
 	draft     *model.Draft
+	verifier  verifyTarget
 	batchers  []*batcher
 	workers   int
 	closed    atomic.Bool
@@ -92,6 +98,7 @@ type Service struct {
 	emittedTokens    atomic.Int64
 	rollbacks        atomic.Int64
 	timeoutFallbacks atomic.Int64
+	errorFallbacks   atomic.Int64
 }
 
 // New creates a service and starts its worker/batcher goroutines.
@@ -112,12 +119,24 @@ func New(cfg Config) *Service {
 		cfg:      cfg,
 		target:   model.NewTarget(cfg.Model),
 		draft:    model.NewDraft(cfg.Model),
+		verifier: model.NewTarget(cfg.Model),
 		batchers: make([]*batcher, cfg.Workers),
 		workers:  cfg.Workers,
 	}
 	for i := range s.batchers {
-		b := newBatcher(s.target, cfg.BatchSize, time.Duration(cfg.BatchWindowMS)*time.Millisecond)
+		b := newBatcher(s.verifier, cfg.BatchSize, time.Duration(cfg.BatchWindowMS)*time.Millisecond)
 		s.batchers[i] = b
+	}
+	return s
+}
+
+// newServiceWithVerifier builds a service whose verification batches are
+// served by v instead of the simulated target. It exists solely for
+// deterministic fault injection in tests (e.g. non-timeout verify errors).
+func newServiceWithVerifier(cfg Config, v verifyTarget) *Service {
+	s := New(cfg)
+	for _, b := range s.batchers {
+		b.target = v
 	}
 	return s
 }
@@ -170,14 +189,15 @@ func (s *Service) runOne(parent context.Context, req Request, b *batcher) (res *
 	s.emittedTokens.Add(st.EmittedTokens)
 	s.rollbacks.Add(st.Rollbacks)
 	s.timeoutFallbacks.Add(st.TimeoutFallbacks)
+	s.errorFallbacks.Add(st.ErrorFallbacks)
 
 	if err != nil {
 		s.requestsFailed.Add(1)
-		return &Result{ID: req.ID, Tokens: tokens, Err: err}
+		return &Result{ID: req.ID, Tokens: tokens, Err: err, Stats: st}
 	}
 	_ = stepResults
 	s.requestsOK.Add(1)
-	return &Result{ID: req.ID, Tokens: tokens}
+	return &Result{ID: req.ID, Tokens: tokens, Stats: st}
 }
 
 // Stats returns an aggregate snapshot.
@@ -194,6 +214,7 @@ func (s *Service) Stats() Stats {
 		EmittedTokens:    s.emittedTokens.Load(),
 		Rollbacks:        s.rollbacks.Load(),
 		TimeoutFallbacks: s.timeoutFallbacks.Load(),
+		ErrorFallbacks:   s.errorFallbacks.Load(),
 	}
 }
 

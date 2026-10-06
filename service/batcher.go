@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"sync"
 	"time"
-
-	"github.com/guoyyit/speculative-decoding-go/model"
 )
 
 var errServiceClosed = errors.New("service: closed")
@@ -30,12 +28,19 @@ func (e panicErr) Error() string { return fmt.Sprintf("service: internal panic: 
 
 func panicError(v any) error { return panicErr{v: v} }
 
+// verifyTarget is the model surface the batcher needs. In production it is
+// *model.Target; tests may supply a deterministic failing implementation to
+// exercise non-timeout verification failures.
+type verifyTarget interface {
+	Verify(ctx context.Context, history []int, candidates []int) ([][]float64, error)
+}
+
 // batcher groups concurrent verification calls into bounded batches. The
 // grouping only controls scheduling: each call's rows are computed from its
 // own history/candidates by the stateless target model, so batching cannot
 // change any request's distribution.
 type batcher struct {
-	target *model.Target
+	target verifyTarget
 	max    int
 	window time.Duration
 
@@ -44,7 +49,7 @@ type batcher struct {
 	wg    sync.WaitGroup
 }
 
-func newBatcher(target *model.Target, max int, window time.Duration) *batcher {
+func newBatcher(target verifyTarget, max int, window time.Duration) *batcher {
 	b := &batcher{
 		target: target,
 		max:    max,

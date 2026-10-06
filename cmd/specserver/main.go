@@ -59,10 +59,10 @@ func main() {
 	}
 
 	st := svc.Stats()
-	fmt.Printf("\nstats: accept-rate=%.3f tokens/step=%.3f success=%d fallback=%d failed=%d rollbacks=%d timeouts=%d\n",
+	fmt.Printf("\nstats: accept-rate=%.3f tokens/step=%.3f success=%d fallback=%d(timeout=%d error=%d) failed=%d rollbacks=%d emitted=%d\n",
 		st.AcceptRate(), st.TokensPerStep(),
-		st.SuccessSteps, st.FallbackSteps, st.FailedSteps,
-		st.Rollbacks, st.TimeoutFallbacks)
+		st.SuccessSteps, st.FallbackSteps, st.TimeoutFallbacks, st.ErrorFallbacks,
+		st.FailedSteps, st.Rollbacks, st.EmittedTokens)
 
 	// Reproducibility: same seed + same input must produce identical output.
 	first := svc.Submit(ctx, service.Request{ID: "repro-a", Prompt: prompt, MaxNewTokens: 12, Seed: 77})
